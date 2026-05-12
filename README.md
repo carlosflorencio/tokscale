@@ -278,6 +278,7 @@ Press `g` in the TUI or use `--group-by` in `--light`/`--json` mode to control h
 | **Model** | `--group-by model` | ✅ | One row per model — merges all clients and providers |
 | **Client + Model** | `--group-by client,model` | | One row per client-model pair |
 | **Client + Provider + Model** | `--group-by client,provider,model` | | Most granular — no merging |
+| **Workspace + Model** | `--group-by workspace,model` | | Group local usage by workspace key, then model |
 | **Session + Model** | `--group-by session,model` | | One row per `session_id` and model — attribute cost to a specific agent-CLI session |
 | **Client + Session + Model** | `--group-by client,session,model` | | One row per client, session, and model — useful for multi-agent runners that join on `session_id` |
 
