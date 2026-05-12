@@ -53,6 +53,16 @@ impl GroupByPickerDialog {
                 label: "Workspace + Model",
                 description: "Group local usage by workspace key, then model",
             },
+            GroupByOption {
+                value: GroupBy::Session,
+                label: "Session + Model",
+                description: "One row per session_id and model (attribute cost per session)",
+            },
+            GroupByOption {
+                value: GroupBy::ClientSession,
+                label: "Client + Session + Model",
+                description: "One row per client, session_id, and model",
+            },
         ];
 
         let cursor = options.iter().position(|o| o.value == current).unwrap_or(1);
