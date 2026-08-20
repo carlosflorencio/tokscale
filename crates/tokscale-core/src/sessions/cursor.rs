@@ -128,16 +128,19 @@ fn infer_provider(model: &str) -> &'static str {
     provider_identity::inferred_provider_from_model(model).unwrap_or("cursor")
 }
 
-/// Parse a cost string like "$0.50" or "0.50" as a finite number.
+/// Parse a cost string like "$0.50" or "0.50" as a finite, non-negative number.
 ///
 /// `Some(0.0)` represents an explicit zero from Cursor. Missing, sentinel,
-/// invalid, and non-finite values return `None` so callers can distinguish
+/// invalid, negative, and non-finite values return `None` so callers can distinguish
 /// provider-reported zero cost from a row that still needs estimation.
 fn parse_finite_cost(cost_str: &str) -> Option<f64> {
     let cleaned = cost_str.replace(['$', ','], "");
     let trimmed = cleaned.trim();
 
-    trimmed.parse::<f64>().ok().filter(|cost| cost.is_finite())
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 /// Parse a cost string, defaulting missing or invalid values to zero.
@@ -383,6 +386,7 @@ mod tests {
         assert_eq!(parse_finite_cost("Included"), None);
         assert_eq!(parse_finite_cost("-"), None);
         assert_eq!(parse_finite_cost("inf"), None);
+        assert_eq!(parse_finite_cost("-0.50"), None);
     }
 
     #[test]
@@ -548,5 +552,21 @@ mod tests {
             messages[0].cost_source,
             super::super::CostSource::ProviderReported
         );
+    }
+
+    #[test]
+    fn test_negative_cost_is_not_provider_reported() {
+        let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-08-18T12:00:00.000Z","On-Demand","gpt-5","No","10","5","20","3","38","-$0.50""#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.csv");
+        std::fs::write(&file_path, csv).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cost, 0.0);
+        assert_eq!(messages[0].cost_source, super::super::CostSource::Unknown);
     }
 }
