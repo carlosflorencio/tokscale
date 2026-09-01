@@ -482,6 +482,19 @@ fn upsert_credentials(token: &str, label: Option<&str>) -> Result<String> {
     };
 
     store.accounts.insert(account_id.clone(), credentials);
+
+    // Switching the active account must also move the cache files, exactly like
+    // `set_active_account`. `usage.json` always belongs to the active account, so
+    // when the desktop login points at a different account than the stored one we
+    // rename the current `usage.json` back under the old account and promote the
+    // incoming account's per-account cache to `usage.json`. Without this the sync
+    // reconciliation would treat the previous account's `usage.json` as the new
+    // active account's and could drop the new account's only cache.
+    let old_active_id = store.active_account_id.clone();
+    if old_active_id != account_id {
+        let _ = reconcile_cache_files(&old_active_id, &account_id);
+    }
+
     store.active_account_id = account_id.clone();
     save_credentials_store(&store)?;
     Ok(account_id)
