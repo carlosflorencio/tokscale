@@ -69,14 +69,16 @@ const CURSOR_JSON_PAGE_SIZE: usize = 500;
 /// above this admits up to a quarter-million events.
 const CURSOR_MAX_JSON_PAGES: usize = 500;
 
-/// Per-page ceiling on the usage-events JSON body, enforced *while* the body is
-/// read rather than after it has all arrived. Without it a page buffers whatever
-/// the server sends for as long as the transfer is allowed to run, and
-/// [`CURSOR_EXPLICIT_SYNC_TIMEOUT`] deliberately widens that window to 120s — so
-/// a malformed or runaway response could grow process memory for two minutes.
+/// Cumulative ceiling on the usage-events JSON downloaded in one fetch, enforced
+/// *while* each page is read rather than after it has all arrived, and counted
+/// across every page so a paginated response can't sidestep it. Without it a
+/// download buffers whatever the server sends for as long as the transfer is
+/// allowed to run, and [`CURSOR_EXPLICIT_SYNC_TIMEOUT`] deliberately widens that
+/// window to 120s — so a malformed or runaway response could grow process memory
+/// for two minutes.
 ///
-/// 64 MiB is generous for a single page and still bounded, holding peak memory
-/// for the download to a fraction of a developer machine's RAM.
+/// 64 MiB is generous for a full usage history and still bounded, holding peak
+/// memory for the download to a fraction of a developer machine's RAM.
 const CURSOR_MAX_JSON_BYTES: usize = 64 * 1024 * 1024;
 
 /// Marker file touched at the end of every `sync_cursor_cache` run (even when
@@ -1093,7 +1095,9 @@ pub async fn fetch_cursor_usage_events_json(
 /// Walks pages of `get-filtered-usage-events` (a POST endpoint carrying an
 /// `Origin` header for its CSRF check) until it has collected every event, then
 /// returns the dashboard response shape with all pages' `usageEventsDisplay`
-/// aggregated into one array.
+/// aggregated into one array. `max_body_bytes` is a cumulative ceiling spanning
+/// every page, and a page that omits the `usageEventsDisplay` array is an error
+/// so a malformed 200 never masquerades as an empty result.
 async fn fetch_cursor_usage_events_json_from(
     url: &str,
     session_token: &str,
@@ -1104,6 +1108,7 @@ async fn fetch_cursor_usage_events_json_from(
     let client = build_cursor_http_client()?;
     let mut all_events: Vec<serde_json::Value> = Vec::new();
     let mut total_count: Option<u64> = None;
+    let mut bytes_read: usize = 0;
 
     for page in 1..=CURSOR_MAX_JSON_PAGES {
         let body = serde_json::json!({
@@ -1134,7 +1139,18 @@ async fn fetch_cursor_usage_events_json_from(
             anyhow::bail!("Cursor API returned status {}", response.status());
         }
 
-        let text = read_cursor_body_with_cap(response, max_body_bytes, "usage events JSON").await?;
+        // The byte ceiling is cumulative across pages: each page may read only
+        // what earlier pages left of the budget, so a paginated response can't
+        // sidestep the cap by spreading a huge payload over many pages.
+        let remaining = match max_body_bytes.checked_sub(bytes_read).filter(|r| *r > 0) {
+            Some(remaining) => remaining,
+            None => anyhow::bail!(
+                "Cursor usage events JSON exceeded the {max_body_bytes} byte limit across pages"
+            ),
+        };
+        let text = read_cursor_body_with_cap(response, remaining, "usage events JSON").await?;
+        bytes_read += text.len();
+
         let page_value: serde_json::Value = serde_json::from_str(&text)
             .context("Invalid response from Cursor API - expected usage events JSON")?;
 
@@ -1144,23 +1160,36 @@ async fn fetch_cursor_usage_events_json_from(
                 .and_then(|value| value.as_u64());
         }
 
-        let page_events = page_value
+        // A well-formed page always carries a `usageEventsDisplay` array. A 200
+        // that omits it (a WAF challenge, an API change) is a failure, not a
+        // silent zero-event result, so the caller never overwrites a good cache
+        // with nothing.
+        let page_events = match page_value
             .get("usageEventsDisplay")
-            .and_then(|events| events.as_array())
-            .cloned()
-            .unwrap_or_default();
+            .map(|events| events.as_array())
+        {
+            Some(Some(events)) => events.clone(),
+            _ => {
+                anyhow::bail!("Invalid response from Cursor API - missing usageEventsDisplay array")
+            }
+        };
         let received = page_events.len();
         all_events.extend(page_events);
 
-        // Stop when a page comes back empty or short (last page), or once we've
-        // collected the advertised total. A short page always terminates so a
-        // server that omits or under-reports the total can't loop forever.
-        if received == 0 || received < page_size {
-            break;
-        }
-        if let Some(total) = total_count {
-            if all_events.len() as u64 >= total {
-                break;
+        // Once the advertised total is known, keep paging until it is reached so
+        // a server that clamps `pageSize` (a short page while more events remain)
+        // doesn't stop the walk early; only an empty page terminates then. Fall
+        // back to the short/empty-page heuristic when no total was reported.
+        match total_count {
+            Some(total) => {
+                if all_events.len() as u64 >= total || received == 0 {
+                    break;
+                }
+            }
+            None => {
+                if received == 0 || received < page_size {
+                    break;
+                }
             }
         }
     }
@@ -1282,15 +1311,21 @@ where
     }
 
     // The active account is cached as `usage.json`; drop any per-account
-    // duplicate (JSON or legacy CSV) left over from when it was a secondary.
+    // duplicate left over from when it was a secondary. The JSON dup is a stale
+    // copy of what this run rewrites, so it is removed, but the legacy CSV dup is
+    // archived rather than deleted so pre-migration history survives.
     let active_sanitized = sanitize_account_id_for_filename(&store.active_account_id);
-    for dup in [
-        cache_dir.join(format!("usage.{active_sanitized}.json")),
-        cache_dir.join(format!("usage.{active_sanitized}.csv")),
-    ] {
-        if dup.exists() {
-            let _ = fs::remove_file(&dup);
-        }
+    let dup_json = cache_dir.join(format!("usage.{active_sanitized}.json"));
+    if dup_json.exists() {
+        let _ = fs::remove_file(&dup_json);
+    }
+    let dup_csv = cache_dir.join(format!("usage.{active_sanitized}.csv"));
+    if dup_csv.exists() {
+        let label = dup_csv
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("usage");
+        let _ = archive_cache_file_in_dir(&cache_dir, &dup_csv, label);
     }
 
     let mut total_rows = 0;
@@ -1312,18 +1347,34 @@ where
                 };
 
                 let event_count = count_cursor_json_events(&json_text);
+                let legacy_csv = file_path.with_extension("csv");
+
+                // A zero-event result is suspicious once cached history exists:
+                // overwriting `usage.json` with nothing and archiving the legacy
+                // CSV would strip real usage from reports. Keep both caches intact
+                // and record it so the next sync can recover instead.
+                if event_count == 0 && (file_path.exists() || legacy_csv.exists()) {
+                    errors.push(format!(
+                        "{}: sync returned zero events; keeping existing cache",
+                        account_id
+                    ));
+                    continue;
+                }
 
                 if let Err(e) = atomic_write_file(&file_path, &json_text) {
                     errors.push(format!("{}: {}", account_id, e));
                 } else {
                     total_rows += event_count;
                     success_count += 1;
-                    // Remove the legacy CSV counterpart now that JSON is the
-                    // authoritative cache, so the scanner never parses both and
-                    // double-counts this account.
-                    let legacy_csv = file_path.with_extension("csv");
+                    // Archive (don't delete) the legacy CSV counterpart now that
+                    // JSON is authoritative: pre-migration history survives and
+                    // the scanner never parses both and double-counts this account.
                     if legacy_csv.exists() {
-                        let _ = fs::remove_file(&legacy_csv);
+                        let label = legacy_csv
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or("usage");
+                        let _ = archive_cache_file_in_dir(&cache_dir, &legacy_csv, label);
                     }
                 }
             }
@@ -1392,6 +1443,20 @@ pub async fn sync_cursor_cache(explicit: bool) -> SyncCursorResult {
 
 fn archive_cache_file(file_path: &std::path::Path, label: &str) -> Result<()> {
     let cache_dir = get_cursor_cache_dir()?;
+    archive_cache_file_in_dir(&cache_dir, file_path, label)
+}
+
+/// Moves `file_path` into `<cache_dir>/archive/` under a timestamped, sanitized
+/// name so a legacy cache is preserved rather than deleted during migration.
+///
+/// Kept `cache_dir`-relative (rather than resolving the real cache dir itself)
+/// so callers inside a synced-home flow archive into the same directory they are
+/// operating on and tests can point it at a temporary home.
+fn archive_cache_file_in_dir(
+    cache_dir: &std::path::Path,
+    file_path: &std::path::Path,
+    label: &str,
+) -> Result<()> {
     let archive_dir = cache_dir.join("archive");
     if !archive_dir.exists() {
         fs::create_dir_all(&archive_dir)?;
@@ -2106,6 +2171,69 @@ mod tests {
     }
 
     #[test]
+    fn test_usage_events_json_keeps_paging_when_server_clamps_page_size() {
+        // page_size 5 is requested, but the server clamps and returns a short
+        // first page (2 of an advertised 3). The advertised total must win so the
+        // walk continues instead of stopping on the short page and dropping rows.
+        let (url, requests) = serve_json_pages(vec![
+            (
+                String::new(),
+                json_page(
+                    3,
+                    &[
+                        &json_event("c1", "1788171994001"),
+                        &json_event("c2", "1788171994002"),
+                    ],
+                ),
+            ),
+            (
+                String::new(),
+                json_page(3, &[&json_event("c3", "1788171994003")]),
+            ),
+        ]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let text = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                5,
+            ))
+            .expect("a clamped short page must not stop pagination early");
+
+        assert_eq!(count_cursor_json_events(&text), 3);
+        assert_eq!(requests.lock().unwrap().len(), 2, "must walk both pages");
+    }
+
+    #[test]
+    fn test_usage_events_json_missing_display_array_is_an_error() {
+        // A 200 that omits the usageEventsDisplay array (a WAF challenge or API
+        // change) must surface as an error, not a silent zero-event result, so a
+        // good cache is never overwritten with nothing.
+        let (url, _requests) = serve_json_pages(vec![(
+            String::new(),
+            br#"{"totalUsageEventsCount":0,"message":"blocked"}"#.to_vec(),
+        )]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                500,
+            ))
+            .expect_err("a response without usageEventsDisplay must fail");
+        assert!(
+            format!("{err:#}").contains("usageEventsDisplay"),
+            "the error must name the missing array: {err:#}"
+        );
+    }
+
+    #[test]
     fn test_usage_events_json_forbidden_surfaces_login_hint() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2374,7 +2502,7 @@ mod tests {
         )?;
 
         // Seed legacy CSV caches from before the JSON switch; the sync must
-        // replace them with JSON and remove the stale CSV counterparts.
+        // replace them with JSON and archive (not delete) the stale CSVs.
         let cache_dir = cursor_cache_dir(temp_dir.path());
         fs::create_dir_all(&cache_dir)?;
         fs::write(cache_dir.join("usage.csv"), "Date,Model\nold\n")?;
@@ -2418,9 +2546,67 @@ mod tests {
         );
         // The active account is never duplicated as a per-account file.
         assert!(!cache_dir.join("usage.active-account.json").exists());
-        // Legacy CSV counterparts are removed so the scanner can't double-count.
+        // Legacy CSVs are moved out of the scan path so they can't double-count,
+        // but they are archived rather than deleted so history survives.
         assert!(!cache_dir.join("usage.csv").exists());
         assert!(!cache_dir.join("usage.team-account.csv").exists());
+        let archived: Vec<_> = fs::read_dir(cache_dir.join("archive"))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "csv"))
+            .collect();
+        assert_eq!(
+            archived.len(),
+            2,
+            "both legacy CSVs must be archived, not deleted"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_keeps_existing_cache_when_fetch_returns_zero_events() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "active-account".to_string(),
+            CursorCredentials {
+                session_token: "token-active".to_string(),
+                user_id: Some("active-account".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                expires_at: None,
+                label: Some("work".to_string()),
+            },
+        );
+        save_credentials_store_in_home(
+            temp_dir.path(),
+            &CursorCredentialsStore {
+                version: 1,
+                active_account_id: "active-account".to_string(),
+                accounts,
+            },
+        )?;
+
+        // Seed a good existing JSON cache. A later sync that comes back empty
+        // must not overwrite it with nothing.
+        let cache_dir = cursor_cache_dir(temp_dir.path());
+        fs::create_dir_all(&cache_dir)?;
+        let seeded = r#"{"usageEventsDisplay":[{"conversationId":"keep","timestamp":"1","model":"gpt-5","chargedCents":1}]}"#;
+        fs::write(cache_dir.join("usage.json"), seeded)?;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let result = runtime.block_on(sync_cursor_cache_with_fetcher_in_home(
+            temp_dir.path(),
+            |_session_token| async move { Ok(r#"{"usageEventsDisplay":[]}"#.to_string()) },
+        ));
+
+        // The empty result is refused; the seeded cache is left untouched.
+        assert!(!result.synced);
+        assert_eq!(
+            fs::read_to_string(cache_dir.join("usage.json"))?,
+            seeded,
+            "a zero-event sync must not clobber existing cached usage"
+        );
 
         Ok(())
     }

@@ -13,7 +13,7 @@
 //! - v2 (new): Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
 //! - v3 (latest): Date,Cloud Agent ID,Automation ID,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
 
-use super::{timestamp_to_date, UnifiedMessage};
+use super::{timestamp_to_date_with_timezone, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use serde::Deserialize;
 use std::path::Path;
@@ -133,14 +133,6 @@ fn infer_provider(model: &str) -> &'static str {
     provider_identity::inferred_provider_from_model(model).unwrap_or("cursor")
 }
 
-/// Cached Cursor usage-events JSON: the dashboard response shape, with every
-/// page's `usageEventsDisplay` aggregated into one array by the CLI.
-#[derive(Debug, Deserialize)]
-struct CursorUsageEventsFile {
-    #[serde(rename = "usageEventsDisplay", default)]
-    usage_events_display: Vec<CursorUsageEvent>,
-}
-
 /// One row of `usageEventsDisplay`. Only the fields tokscale consumes are
 /// modeled; unknown fields are ignored so upstream additions don't break parsing.
 #[derive(Debug, Deserialize)]
@@ -153,36 +145,116 @@ struct CursorUsageEvent {
     timestamp: Option<serde_json::Value>,
     #[serde(default)]
     model: Option<String>,
-    /// Authoritative amount billed, in cents (may be integer or fractional).
-    #[serde(rename = "chargedCents", default)]
+    /// Authoritative amount billed, in cents. Cursor may send it as an integer,
+    /// a float, or a numeric string, so it is coerced leniently.
+    #[serde(
+        rename = "chargedCents",
+        default,
+        deserialize_with = "de_opt_f64_lenient"
+    )]
     charged_cents: Option<f64>,
     #[serde(rename = "tokenUsage", default)]
     token_usage: Option<CursorTokenUsage>,
 }
 
 /// The per-event token breakdown. `cacheWriteTokens` is absent on many events.
+/// Counts are coerced leniently so a single float (e.g. `10.0`) or numeric
+/// string doesn't fail the whole row.
 #[derive(Debug, Deserialize, Default)]
 struct CursorTokenUsage {
-    #[serde(rename = "inputTokens", default)]
+    #[serde(
+        rename = "inputTokens",
+        default,
+        deserialize_with = "de_opt_i64_lenient"
+    )]
     input_tokens: Option<i64>,
-    #[serde(rename = "outputTokens", default)]
+    #[serde(
+        rename = "outputTokens",
+        default,
+        deserialize_with = "de_opt_i64_lenient"
+    )]
     output_tokens: Option<i64>,
-    #[serde(rename = "cacheReadTokens", default)]
+    #[serde(
+        rename = "cacheReadTokens",
+        default,
+        deserialize_with = "de_opt_i64_lenient"
+    )]
     cache_read_tokens: Option<i64>,
-    #[serde(rename = "cacheWriteTokens", default)]
+    #[serde(
+        rename = "cacheWriteTokens",
+        default,
+        deserialize_with = "de_opt_i64_lenient"
+    )]
     cache_write_tokens: Option<i64>,
 }
 
-/// Parse a Unix-milliseconds timestamp that may arrive as a JSON string or number.
+/// Coerce a JSON number/string into `i64`, tolerating floats and numeric
+/// strings so one unexpected shape doesn't drop an otherwise valid row.
+fn json_value_to_i64(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            trimmed
+                .parse::<i64>()
+                .ok()
+                .or_else(|| trimmed.parse::<f64>().ok().map(|f| f as i64))
+        }
+        _ => None,
+    }
+}
+
+/// Coerce a JSON number/string into `f64`, tolerating `$`/`,` in strings.
+fn json_value_to_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.replace(['$', ','], "").trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn de_opt_i64_lenient<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(json_value_to_i64))
+}
+
+fn de_opt_f64_lenient<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(json_value_to_f64))
+}
+
+/// Parse a Unix-milliseconds timestamp that may arrive as a JSON string or
+/// number. A string is tried as base-10 milliseconds first, then as an
+/// ISO-8601 / RFC 3339 datetime so either shape the dashboard emits resolves.
 fn parse_ms_timestamp(value: &serde_json::Value) -> i64 {
     match value {
-        serde_json::Value::String(s) => s.trim().parse::<i64>().unwrap_or(0),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            trimmed
+                .parse::<i64>()
+                .ok()
+                .or_else(|| parse_iso8601_to_ms(trimmed))
+                .unwrap_or(0)
+        }
         serde_json::Value::Number(n) => n
             .as_i64()
             .or_else(|| n.as_f64().map(|f| f as i64))
             .unwrap_or(0),
         _ => 0,
     }
+}
+
+/// Parse an ISO-8601 / RFC 3339 datetime string into Unix milliseconds.
+fn parse_iso8601_to_ms(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
 
 /// Parse a cost string like "$0.50" or "0.50" as a finite, non-negative number.
@@ -229,26 +301,42 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
 
 /// Parse a Cursor usage events JSON file (dashboard `get-filtered-usage-events`).
 ///
-/// Sessions are keyed by `conversationId` (the Cursor session UUID). Cost comes
-/// straight from `chargedCents` (cents), divided by 100 and marked
-/// provider-reported so the summed session cost equals the sum of `chargedCents`
-/// the dashboard reports. Events with no usable `conversationId` fall back to the
-/// legacy synthetic per-day id so their cost is never dropped from totals.
+/// Sessions are keyed by `conversationId` (the Cursor session UUID). A positive
+/// `chargedCents` is divided by 100 and marked provider-reported; a zero or
+/// missing charge is left with an unknown source so plan-included usage is
+/// priced locally from its token counts instead of being pinned to $0. Rows are
+/// parsed individually so one malformed entry is skipped rather than discarding
+/// the whole cache. Events with no usable `conversationId` fall back to a
+/// UTC-stable synthetic per-day id so their cost is never dropped from totals.
 pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return vec![],
     };
 
-    let parsed: CursorUsageEventsFile = match serde_json::from_str(&content) {
-        Ok(parsed) => parsed,
+    let root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(root) => root,
         Err(_) => return vec![],
     };
 
-    let account_id = account_id_from_cursor_cache_path(path);
-    let mut messages = Vec::with_capacity(parsed.usage_events_display.len());
+    let rows = root
+        .get("usageEventsDisplay")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
 
-    for event in parsed.usage_events_display {
+    let account_id = account_id_from_cursor_cache_path(path);
+    let mut messages = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        // Deserialize each row on its own so one malformed entry (an unexpected
+        // type in a single field) skips just that row instead of discarding the
+        // entire cache.
+        let event: CursorUsageEvent = match serde_json::from_value(row) {
+            Ok(event) => event,
+            Err(_) => continue,
+        };
+
         let model = event.model.unwrap_or_default();
         let model = model.trim();
         if model.is_empty() {
@@ -269,17 +357,22 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
         // its cost still lands in the account's totals.
         let session_id = match event.conversation_id.as_deref().map(str::trim) {
             Some(id) if !id.is_empty() => id.to_string(),
-            _ => format!("cursor-{}-{}", account_id, timestamp_to_date(timestamp)),
+            _ => format!(
+                "cursor-{}-{}",
+                account_id,
+                timestamp_to_date_with_timezone(timestamp, &chrono::Utc)
+            ),
         };
 
         let token_usage = event.token_usage.unwrap_or_default();
 
-        // `chargedCents` is the authoritative amount Cursor billed for the event
-        // (0 for free-credit rows). Divide by 100 and mark provider-reported so
-        // it is neither re-estimated nor overwritten by local pricing.
+        // `chargedCents` is the authoritative amount Cursor billed for the event.
+        // Only a positive charge is treated as provider-reported; a zero charge
+        // (plan-included / free-credit rows) is left unknown so local pricing can
+        // estimate it from the token counts instead of pinning it to $0.
         let cost = event
             .charged_cents
-            .filter(|cents| cents.is_finite() && *cents >= 0.0)
+            .filter(|cents| cents.is_finite() && *cents > 0.0)
             .map(|cents| cents / 100.0);
 
         let mut message = UnifiedMessage::new(
@@ -796,9 +889,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cursor_events_json_free_credit_is_zero_provider_reported() {
-        // Free-credit rows are billed $0 (chargedCents = 0); that explicit zero
-        // is provider-reported so it is neither dropped nor re-estimated.
+    fn test_parse_cursor_events_json_plan_included_zero_is_unknown() {
+        // Plan-included / free-credit rows are billed $0 (chargedCents = 0). That
+        // zero is left with an unknown source so local pricing can estimate the
+        // real cost from the token counts instead of pinning the row to $0.
         let json = r#"{
             "usageEventsDisplay": [
                 {
@@ -819,10 +913,7 @@ mod tests {
         let messages = parse_cursor_file(&file_path);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].cost, 0.0);
-        assert_eq!(
-            messages[0].cost_source,
-            super::super::CostSource::ProviderReported
-        );
+        assert_eq!(messages[0].cost_source, super::super::CostSource::Unknown);
     }
 
     #[test]
@@ -910,5 +1001,73 @@ mod tests {
         let messages = parse_cursor_file(&file_path);
         assert_eq!(messages.len(), 1);
         assert!(messages[0].session_id.starts_with("cursor-team-a-"));
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_skips_only_the_malformed_row() {
+        // A single row with an unexpected shape (tokenUsage as a string) must be
+        // skipped on its own rather than discarding every other event.
+        let json = r#"{
+            "usageEventsDisplay": [
+                {"timestamp": "1788171994838", "model": "gpt-5", "chargedCents": 1, "tokenUsage": "oops", "conversationId": "bad"},
+                {"timestamp": "1788171994838", "model": "gpt-5", "chargedCents": 1, "conversationId": "good"}
+            ]
+        }"#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        std::fs::write(&file_path, json).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "good");
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_tolerates_float_token_counts() {
+        // Token counts arriving as floats (or numeric strings) must not drop the
+        // row; they are coerced to integers.
+        let json = r#"{
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1788171994838",
+                    "model": "gpt-5",
+                    "chargedCents": "12.5",
+                    "tokenUsage": {"inputTokens": 10.0, "outputTokens": "5"},
+                    "conversationId": "float-row"
+                }
+            ]
+        }"#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        std::fs::write(&file_path, json).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].tokens.output, 5);
+        assert!((messages[0].cost - 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_accepts_iso8601_timestamp() {
+        // The same instant, once as ISO-8601 and once as base-10 milliseconds,
+        // must resolve to identical timestamps.
+        let json = r#"{
+            "usageEventsDisplay": [
+                {"timestamp": "2026-08-18T12:00:00.000Z", "model": "gpt-5", "chargedCents": 1, "conversationId": "iso"},
+                {"timestamp": "1787054400000", "model": "gpt-5", "chargedCents": 1, "conversationId": "ms"}
+            ]
+        }"#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        std::fs::write(&file_path, json).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].timestamp > 0);
+        assert_eq!(messages[0].timestamp, messages[1].timestamp);
     }
 }
