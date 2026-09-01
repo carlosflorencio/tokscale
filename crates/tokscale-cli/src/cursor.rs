@@ -1388,34 +1388,37 @@ where
                             .unwrap_or("usage");
                         let _ = archive_cache_file_in_dir(&cache_dir, &legacy_csv, label);
                     }
-
-                    // The active account is cached as `usage.json`. Only now that
-                    // its fresh cache is safely written do we clear any per-account
-                    // duplicate left over from when it was a secondary, so a failed
-                    // fetch never strips the previous data pre-emptively. The JSON
-                    // dup is a stale copy of what we just wrote (removed); the
-                    // legacy CSV dup is archived so pre-migration history survives.
-                    if is_active {
-                        let active_sanitized =
-                            sanitize_account_id_for_filename(&store.active_account_id);
-                        let dup_json = cache_dir.join(format!("usage.{active_sanitized}.json"));
-                        if dup_json.exists() {
-                            let _ = fs::remove_file(&dup_json);
-                        }
-                        let dup_csv = cache_dir.join(format!("usage.{active_sanitized}.csv"));
-                        if dup_csv.exists() {
-                            let label = dup_csv
-                                .file_stem()
-                                .and_then(|stem| stem.to_str())
-                                .unwrap_or("usage");
-                            let _ = archive_cache_file_in_dir(&cache_dir, &dup_csv, label);
-                        }
-                    }
                 }
             }
             Err(e) => {
                 errors.push(format!("{}: {}", account_id, e));
             }
+        }
+    }
+
+    // Reconcile the active account's leftover per-account duplicate. The active
+    // account is cached as `usage.json`; a `usage.<active_id>.json` copy left
+    // over from when it was a secondary is only safe to drop once `usage.json`
+    // actually exists on disk — whether this run just wrote it or a prior run
+    // did. Gating on that existence keeps the duplicate when a failed first-time
+    // fetch leaves no `usage.json` (it is then the only data we have), while a
+    // failed fetch that still has a good `usage.json` clears the duplicate so the
+    // scanner never reads both JSON caches and double-counts the active account.
+    // The JSON dup is a stale copy (removed); the legacy CSV dup is archived so
+    // pre-migration history survives.
+    if cache_dir.join("usage.json").exists() {
+        let active_sanitized = sanitize_account_id_for_filename(&store.active_account_id);
+        let dup_json = cache_dir.join(format!("usage.{active_sanitized}.json"));
+        if dup_json.exists() {
+            let _ = fs::remove_file(&dup_json);
+        }
+        let dup_csv = cache_dir.join(format!("usage.{active_sanitized}.csv"));
+        if dup_csv.exists() {
+            let label = dup_csv
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("usage");
+            let _ = archive_cache_file_in_dir(&cache_dir, &dup_csv, label);
         }
     }
 
@@ -2676,6 +2679,62 @@ mod tests {
             fs::read_to_string(cache_dir.join("usage.json"))?,
             seeded,
             "a zero-event sync must not clobber existing cached usage"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_clears_active_duplicate_even_when_fetch_fails() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "active-account".to_string(),
+            CursorCredentials {
+                session_token: "token-active".to_string(),
+                user_id: Some("active-account".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                expires_at: None,
+                label: Some("work".to_string()),
+            },
+        );
+        save_credentials_store_in_home(
+            temp_dir.path(),
+            &CursorCredentialsStore {
+                version: 1,
+                active_account_id: "active-account".to_string(),
+                accounts,
+            },
+        )?;
+
+        // A good `usage.json` already exists alongside a stale per-account
+        // duplicate left over from when this account was a secondary. If the
+        // fetch fails, both JSON caches would otherwise remain and the scanner
+        // would double-count the active account.
+        let cache_dir = cursor_cache_dir(temp_dir.path());
+        fs::create_dir_all(&cache_dir)?;
+        let good = r#"{"usageEventsDisplay":[{"conversationId":"keep","timestamp":"1","model":"gpt-5","chargedCents":1}]}"#;
+        fs::write(cache_dir.join("usage.json"), good)?;
+        fs::write(cache_dir.join("usage.active-account.json"), good)?;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let result = runtime.block_on(sync_cursor_cache_with_fetcher_in_home(
+            temp_dir.path(),
+            |_session_token| async move { Err(anyhow::anyhow!("network down")) },
+        ));
+
+        // The fetch failed, but the good cache survives and the duplicate is
+        // reconciled so the scanner reads only one JSON cache for the account.
+        assert!(!result.synced);
+        assert_eq!(
+            fs::read_to_string(cache_dir.join("usage.json"))?,
+            good,
+            "a failed fetch must not clobber the existing active cache"
+        );
+        assert!(
+            !cache_dir.join("usage.active-account.json").exists(),
+            "the stale active duplicate must be cleared so it can't double-count"
         );
 
         Ok(())
