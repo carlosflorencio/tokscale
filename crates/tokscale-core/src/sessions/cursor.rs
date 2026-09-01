@@ -130,7 +130,10 @@ fn account_id_from_cursor_cache_path(path: &Path) -> String {
 
 /// Provider inference from model name
 fn infer_provider(model: &str) -> &'static str {
-    provider_identity::inferred_provider_from_model(model).unwrap_or("cursor")
+    // Delimiter-aware inference so a model id that only contains a provider
+    // family as a substring isn't misattributed (which would apply the wrong
+    // pricing). Both the JSON and CSV lanes flow through here.
+    provider_identity::inferred_provider_from_model_delimited(model).unwrap_or("cursor")
 }
 
 /// One row of `usageEventsDisplay`. Only the fields tokscale consumes are
@@ -615,6 +618,9 @@ mod tests {
         assert_eq!(infer_provider("deepseek-coder"), "deepseek");
         assert_eq!(infer_provider("llama-3"), "meta");
         assert_eq!(infer_provider("unknown-model"), "cursor");
+        // A family name appearing only as a substring (not at a token boundary)
+        // must not be misattributed; delimiter-aware inference falls back.
+        assert_eq!(infer_provider("supergptmodel"), "cursor");
     }
 
     #[test]

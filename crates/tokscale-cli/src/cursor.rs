@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Timeout for every Cursor HTTP request. Picked to bound the worst case for
 /// auto-sync (which runs synchronously before local reports and the TUI) while
@@ -1110,20 +1110,34 @@ async fn fetch_cursor_usage_events_json_from(
     let mut total_count: Option<u64> = None;
     let mut bytes_read: usize = 0;
 
+    // Overall wall-clock budget for the entire paginated walk. Without it the
+    // per-page timeout would multiply across every page, so a slow server could
+    // stall report startup (auto-sync runs first) for that timeout times the page
+    // count. Each page's timeout is clamped to what remains of this budget below,
+    // and the walk aborts once it is spent.
+    let per_page_timeout = timeout_override.unwrap_or(CURSOR_HTTP_TIMEOUT);
+    let fetch_deadline = Instant::now() + per_page_timeout;
+
+    let mut completed = false;
     for page in 1..=CURSOR_MAX_JSON_PAGES {
+        let remaining_budget = fetch_deadline.saturating_duration_since(Instant::now());
+        if remaining_budget.is_zero() {
+            anyhow::bail!(
+                "Cursor usage events fetch exceeded its overall time budget before the full history was collected"
+            );
+        }
+
         let body = serde_json::json!({
             "teamId": 0,
             "page": page,
             "pageSize": page_size,
         });
 
-        let mut req = client
+        let req = client
             .post(url)
             .headers(build_cursor_json_headers(session_token))
-            .json(&body);
-        if let Some(timeout) = timeout_override {
-            req = req.timeout(timeout);
-        }
+            .json(&body)
+            .timeout(per_page_timeout.min(remaining_budget));
 
         let response = req.send().await?;
 
@@ -1178,20 +1192,36 @@ async fn fetch_cursor_usage_events_json_from(
 
         // Once the advertised total is known, keep paging until it is reached so
         // a server that clamps `pageSize` (a short page while more events remain)
-        // doesn't stop the walk early; only an empty page terminates then. Fall
-        // back to the short/empty-page heuristic when no total was reported.
-        match total_count {
+        // doesn't stop the walk early. An empty page before the total is reached
+        // means the server truncated the history mid-walk, so it is an error
+        // rather than a silently partial cache. Fall back to the short/empty-page
+        // heuristic only when no total was reported.
+        let done = match total_count {
             Some(total) => {
-                if all_events.len() as u64 >= total || received == 0 {
-                    break;
+                if all_events.len() as u64 >= total {
+                    true
+                } else if received == 0 {
+                    anyhow::bail!(
+                        "Cursor API returned an empty page before its advertised total of {total} events; refusing to cache a partial history"
+                    );
+                } else {
+                    false
                 }
             }
-            None => {
-                if received == 0 || received < page_size {
-                    break;
-                }
-            }
+            None => received == 0 || received < page_size,
+        };
+        if done {
+            completed = true;
+            break;
         }
+    }
+
+    // Exhausting the page cap without a clean stop means only part of the history
+    // was collected; caching it would masquerade as a full sync, so fail instead.
+    if !completed {
+        anyhow::bail!(
+            "Cursor usage events exceeded the {CURSOR_MAX_JSON_PAGES}-page fetch limit before the full history was collected; refusing to cache a partial history"
+        );
     }
 
     let aggregated = serde_json::json!({
@@ -1310,24 +1340,6 @@ where
         let _ = fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700));
     }
 
-    // The active account is cached as `usage.json`; drop any per-account
-    // duplicate left over from when it was a secondary. The JSON dup is a stale
-    // copy of what this run rewrites, so it is removed, but the legacy CSV dup is
-    // archived rather than deleted so pre-migration history survives.
-    let active_sanitized = sanitize_account_id_for_filename(&store.active_account_id);
-    let dup_json = cache_dir.join(format!("usage.{active_sanitized}.json"));
-    if dup_json.exists() {
-        let _ = fs::remove_file(&dup_json);
-    }
-    let dup_csv = cache_dir.join(format!("usage.{active_sanitized}.csv"));
-    if dup_csv.exists() {
-        let label = dup_csv
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("usage");
-        let _ = archive_cache_file_in_dir(&cache_dir, &dup_csv, label);
-    }
-
     let mut total_rows = 0;
     let mut success_count = 0;
     let mut errors: Vec<String> = Vec::new();
@@ -1375,6 +1387,29 @@ where
                             .and_then(|stem| stem.to_str())
                             .unwrap_or("usage");
                         let _ = archive_cache_file_in_dir(&cache_dir, &legacy_csv, label);
+                    }
+
+                    // The active account is cached as `usage.json`. Only now that
+                    // its fresh cache is safely written do we clear any per-account
+                    // duplicate left over from when it was a secondary, so a failed
+                    // fetch never strips the previous data pre-emptively. The JSON
+                    // dup is a stale copy of what we just wrote (removed); the
+                    // legacy CSV dup is archived so pre-migration history survives.
+                    if is_active {
+                        let active_sanitized =
+                            sanitize_account_id_for_filename(&store.active_account_id);
+                        let dup_json = cache_dir.join(format!("usage.{active_sanitized}.json"));
+                        if dup_json.exists() {
+                            let _ = fs::remove_file(&dup_json);
+                        }
+                        let dup_csv = cache_dir.join(format!("usage.{active_sanitized}.csv"));
+                        if dup_csv.exists() {
+                            let label = dup_csv
+                                .file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .unwrap_or("usage");
+                            let _ = archive_cache_file_in_dir(&cache_dir, &dup_csv, label);
+                        }
                     }
                 }
             }
@@ -2230,6 +2265,41 @@ mod tests {
         assert!(
             format!("{err:#}").contains("usageEventsDisplay"),
             "the error must name the missing array: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_usage_events_json_empty_page_before_total_is_an_error() {
+        // The server advertises 5 events but returns an empty second page before
+        // the total is reached. That is a truncated history, not a clean end, so
+        // it must fail rather than cache the two events as a full sync.
+        let (url, _requests) = serve_json_pages(vec![
+            (
+                String::new(),
+                json_page(
+                    5,
+                    &[
+                        &json_event("c1", "1788171994001"),
+                        &json_event("c2", "1788171994002"),
+                    ],
+                ),
+            ),
+            (String::new(), json_page(5, &[])),
+        ]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                5,
+            ))
+            .expect_err("an empty page before the advertised total must fail");
+        assert!(
+            format!("{err:#}").contains("empty page before its advertised total"),
+            "the error must explain the truncated history: {err:#}"
         );
     }
 
