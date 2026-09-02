@@ -189,6 +189,16 @@ struct CursorTokenUsage {
         deserialize_with = "de_opt_i64_lenient"
     )]
     cache_write_tokens: Option<i64>,
+    /// The metered cost of this event's tokens, in cents. Cursor's
+    /// `aiserver.v1.TokenUsage` carries it next to the token counts and the
+    /// discount fields, so it is populated even when the event was plan-included
+    /// and the wallet was debited nothing.
+    #[serde(
+        rename = "totalCents",
+        default,
+        deserialize_with = "de_opt_f64_lenient"
+    )]
+    total_cents: Option<f64>,
 }
 
 /// Coerce a JSON number/string into `i64`, tolerating floats and numeric
@@ -275,6 +285,15 @@ fn parse_finite_cost(cost_str: &str) -> Option<f64> {
         .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
+/// Keep a cents figure only when it is finite and non-negative.
+///
+/// Mirrors `parse_finite_cost` on the CSV lane so both Cursor sources refuse a
+/// nonsense amount the same way, leaving the row unknown rather than stamping
+/// it provider-reported and immune to repricing.
+fn finite_non_negative_cents(cents: Option<f64>) -> Option<f64> {
+    cents.filter(|value| value.is_finite() && *value >= 0.0)
+}
+
 /// Parse a cost string, defaulting missing or invalid values to zero.
 #[cfg(test)]
 fn parse_cost(cost_str: &str) -> f64 {
@@ -304,10 +323,10 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
 
 /// Parse a Cursor usage events JSON file (dashboard `get-filtered-usage-events`).
 ///
-/// Sessions are keyed by `conversationId` (the Cursor session UUID). A positive
-/// `chargedCents` is divided by 100 and marked provider-reported; a zero or
-/// missing charge is left with an unknown source so plan-included usage is
-/// priced locally from its token counts instead of being pinned to $0. Rows are
+/// Sessions are keyed by `conversationId` (the Cursor session UUID). Cost comes
+/// from the metered `tokenUsage.totalCents`, falling back to `chargedCents`,
+/// divided by 100 and marked provider-reported; an event carrying neither is
+/// left with an unknown source so local pricing can estimate it. Rows are
 /// parsed individually so one malformed entry is skipped rather than discarding
 /// the whole cache. Events with no usable `conversationId` fall back to a
 /// UTC-stable synthetic per-day id so their cost is never dropped from totals.
@@ -369,14 +388,17 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
 
         let token_usage = event.token_usage.unwrap_or_default();
 
-        // `chargedCents` is the authoritative amount Cursor billed for the event.
-        // Only a positive charge is treated as provider-reported; a zero charge
-        // (plan-included / free-credit rows) is left unknown so local pricing can
-        // estimate it from the token counts instead of pinning it to $0.
-        let cost = event
-            .charged_cents
-            .filter(|cents| cents.is_finite() && *cents > 0.0)
-            .map(|cents| cents / 100.0);
+        // Cursor reports two different amounts. `tokenUsage.totalCents` is the
+        // metered cost of the event's own tokens; `chargedCents` is what the
+        // wallet was debited. They agree whenever the user pays, and diverge
+        // exactly on plan-included / free-credit rows, where nothing is billed
+        // but the usage still cost something. Prefer the metered figure so those
+        // rows keep Cursor's own number instead of falling through to local
+        // pricing, which refuses the router labels `auto`/`agent_review` (#1062)
+        // and would drop them into the unpriced bucket at $0.00.
+        let metered_cents = finite_non_negative_cents(token_usage.total_cents)
+            .or_else(|| finite_non_negative_cents(event.charged_cents));
+        let cost = metered_cents.map(|cents| cents / 100.0);
 
         let mut message = UnifiedMessage::new(
             "cursor",
@@ -895,10 +917,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cursor_events_json_plan_included_zero_is_unknown() {
-        // Plan-included / free-credit rows are billed $0 (chargedCents = 0). That
-        // zero is left with an unknown source so local pricing can estimate the
-        // real cost from the token counts instead of pinning the row to $0.
+    fn test_parse_cursor_events_json_plan_included_row_uses_metered_total_cents() {
+        // Plan-included / free-credit rows debit the wallet nothing
+        // (`chargedCents: 0`) while `tokenUsage.totalCents` still carries what
+        // the usage metered. Reading only the charge threw that number away and
+        // handed the row to local pricing, which refuses the router label `auto`
+        // (#1062) — so the row landed at $0.00/Unknown and its tokens fell into
+        // the unpriced bucket. The metered figure must win.
         let json = r#"{
             "usageEventsDisplay": [
                 {
@@ -918,8 +943,155 @@ mod tests {
 
         let messages = parse_cursor_file(&file_path);
         assert_eq!(messages.len(), 1);
+        assert!((messages[0].cost - 0.062).abs() < 1e-9);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
+        // The row must never depend on pricing the label, which is refused.
+        assert!(crate::pricing::lookup::is_routing_label(
+            &messages[0].model_id
+        ));
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_prefers_total_cents_over_charged_cents() {
+        // When the two diverge the metered cost is what tokscale reports, the
+        // same quantity the CSV `Cost` column has always carried. `chargedCents`
+        // describes the credit card, not the usage.
+        let json = r#"{
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1788171994838",
+                    "model": "composer-2",
+                    "chargedCents": 1,
+                    "tokenUsage": {"inputTokens": 10, "totalCents": 25},
+                    "conversationId": "11111111-2222-3333-4444-555555555555"
+                }
+            ]
+        }"#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        std::fs::write(&file_path, json).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 1);
+        assert!((messages[0].cost - 0.25).abs() < 1e-9);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_falls_back_to_charged_cents() {
+        // An event whose `tokenUsage` omits `totalCents` still has an
+        // authoritative amount in `chargedCents`; it must not go unpriced.
+        let json = r#"{
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1788171994838",
+                    "model": "gpt-5",
+                    "chargedCents": 12.5,
+                    "tokenUsage": {"inputTokens": 10, "outputTokens": 5},
+                    "conversationId": "11111111-2222-3333-4444-555555555555"
+                }
+            ]
+        }"#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        std::fs::write(&file_path, json).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 1);
+        assert!((messages[0].cost - 0.125).abs() < 1e-9);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_rejects_negative_and_non_finite_cents() {
+        // A negative or non-numeric metered cost is nonsense, not an
+        // authoritative zero. It falls back to the charge when that is usable
+        // and otherwise stays unknown, mirroring `parse_finite_cost` on the CSV
+        // lane, so a bad figure never becomes immune to repricing.
+        let json = r#"{
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1788171994838",
+                    "model": "composer-2",
+                    "chargedCents": 4,
+                    "tokenUsage": {"inputTokens": 10, "totalCents": -3},
+                    "conversationId": "11111111-2222-3333-4444-555555555555"
+                },
+                {
+                    "timestamp": "1788171994839",
+                    "model": "composer-2",
+                    "chargedCents": -1,
+                    "tokenUsage": {"inputTokens": 10, "totalCents": -3},
+                    "conversationId": "22222222-3333-4444-5555-666666666666"
+                },
+                {
+                    "timestamp": "1788171994840",
+                    "model": "composer-2",
+                    "tokenUsage": {"inputTokens": 10, "totalCents": "not-a-number"},
+                    "conversationId": "33333333-4444-5555-6666-777777777777"
+                }
+            ]
+        }"#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        std::fs::write(&file_path, json).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 3);
+
+        // Negative metered cost -> usable charge wins.
+        assert!((messages[0].cost - 0.04).abs() < 1e-9);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
+
+        // Both unusable -> unknown, so local pricing may still estimate.
+        assert_eq!(messages[1].cost, 0.0);
+        assert_eq!(messages[1].cost_source, super::super::CostSource::Unknown);
+        assert_eq!(messages[2].cost, 0.0);
+        assert_eq!(messages[2].cost_source, super::super::CostSource::Unknown);
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_explicit_zero_total_cents_is_provider_reported() {
+        // A genuine metered zero is a fact Cursor stated, not missing data. The
+        // CSV lane already retains an explicit `$0.00` as provider-reported
+        // (`test_explicit_zero_cost_is_provider_reported`); the JSON lane agrees.
+        let json = r#"{
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1788171994838",
+                    "model": "composer-2",
+                    "tokenUsage": {"inputTokens": 10, "totalCents": 0},
+                    "conversationId": "11111111-2222-3333-4444-555555555555"
+                }
+            ]
+        }"#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        std::fs::write(&file_path, json).unwrap();
+
+        let messages = parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].cost, 0.0);
-        assert_eq!(messages[0].cost_source, super::super::CostSource::Unknown);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
     }
 
     #[test]

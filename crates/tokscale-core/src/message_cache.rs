@@ -1168,9 +1168,11 @@ fn parser_version(client: ClientId) -> u32 {
         // instead of subtracting `Input (w/o Cache Write)`, and a numeric CSV
         // `Cost` (including explicit zero) is retained as provider-reported so
         // repricing no longer drops the Team/Enterprise Cursor Token Rate.
-        // v2->v3: usage-events JSON keys sessions by `conversationId`, prices
-        // plan-included ($0) rows locally instead of pinning them provider-
-        // reported, and uses a UTC-stable synthetic id for the id-less fallback.
+        // v2->v3: usage-events JSON keys sessions by `conversationId`, takes cost
+        // from the metered `tokenUsage.totalCents` (falling back to
+        // `chargedCents`) so plan-included rows keep Cursor's own figure instead
+        // of landing unpriced, and uses a UTC-stable synthetic id for the id-less
+        // fallback.
         ClientId::Cursor => 3,
         // v1->v2: Kimchi's Pi-compatible messages now carry stable namespaced
         // deduplication keys.
